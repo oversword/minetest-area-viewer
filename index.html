@@ -1,0 +1,740 @@
+<html>
+	<head>
+		<script src="three.min.js" ></script>
+		<style>
+			* {
+				padding:0;
+				margin:0;
+			}
+			body {
+				overflow: hidden;
+				font-family: sans-serif;
+			}
+			.options {
+				position: absolute;
+				right: 0;
+				top: 0;
+				height: 100%;
+				width: 160px;
+				background: #fff;
+				z-index:1;
+				overflow: hidden;
+				padding: 20px;
+			}
+			.options label span {
+				font-weight: bold;
+			}
+			.options label {
+				display: block;
+				width: 100%;
+				overflow: hidden;
+			}
+			.options label input {
+				max-width: 100%;
+			}
+			textarea {
+				max-width: 100%;
+				width: 100%;
+			}
+			hr {
+				margin: 10px 0;
+			}
+			#load-notify {
+				position: absolute;
+				z-index: 100;
+				left:0;
+				right:200px;
+				top:0;
+				bottom:0;
+				margin: auto;
+				text-align: center;
+				width: 50%;
+				max-width: 200px;
+				height: 100px;
+				color: #fff;
+			}
+		</style>
+	</head>
+	<body>
+		<canvas id="canvas"></canvas>
+		<div id="load-notify" >Upload a data file to start</div>
+		<div class="options" >
+
+			<span id="coords" ></span>
+			<hr>
+
+			<label>
+				<span>Upload Data</span>
+				<input id="file" type="file" />
+			</label>
+			<hr>
+			<!-- TODO: option for labels -->
+
+			<label>
+				<input
+					name="heatmap"
+					id="heatmap-input"
+					type="checkbox"
+					checked="checked"
+					onchange="document.getElementById('depends-heatmap').hidden = !this.checked;chunkChangeHandler()"
+				/>
+				<span>Heat Map</span>
+			</label>
+			<div id="depends-heatmap" >
+				<label>
+					<span>Chunks X</span>
+					<input
+						name="chunksx"
+						id="chunksx-input"
+						type="number"
+						value="128"
+						min="1"
+						step="1"
+						onchange="chunkChangeHandler()"
+					/>
+				</label>
+				<label>
+					<span>Chunks Y</span>
+					<input
+						name="chunksy"
+						id="chunksy-input"
+						type="number"
+						value="1"
+						min="1"
+						step="1"
+						onchange="chunkChangeHandler()"
+					/>
+				</label>
+				<label>
+					<span>Chunks Z</span>
+					<input
+						name="chunksy"
+						id="chunksz-input"
+						type="number"
+						value="128"
+						min="1"
+						step="1"
+						onchange="chunkChangeHandler()"
+					/>
+				</label>
+			</div>
+			<hr>
+
+			<label>
+				<input
+					name="areas"
+					id="areas-input"
+					type="checkbox"
+					onchange="document.getElementById('depends-areas').hidden = !this.checked;areasChangedHandler()"
+				/>
+				<span>Areas</span>
+			</label>
+			<div id="depends-areas" hidden="hidden" >
+				<label>
+					<span>Max Distance</span>
+					<input
+						name="distance"
+						id="distance-input"
+						type="number"
+						value="1000"
+						min="1"
+						step="1"
+						onchange="distanceChangeHandler()"
+					/>
+				</label>
+			</div>
+			<hr>
+
+			<label>
+				<input
+					name="owner"
+					id="owner-input"
+					type="checkbox"
+					onchange="document.getElementById('owner-name-input').hidden = !this.checked;ownerChangeHandler();"
+				/>
+				<span>Filter by Owner(s)</span>
+				<textarea
+					name="owner-name"
+					id="owner-name-input"
+					type="text"
+					hidden="hidden"
+					onchange="ownerChangeHandler()"
+				></textarea>
+			</label>
+		</div>
+	</body>
+</html>
+
+<script>
+
+// Position fixes and other utilities
+const coordObjToArray = obj => [obj.x,obj.y,obj.z]
+const flatCoords = coords => [coords[0], coords[2]]
+const fixPos = pos => multV(pos, [1, 1, -1])
+const unfixPos = fixPos
+const getBaseLog = base => {
+	const baselog = Math.log(base)
+	return n => Math.log(n) / baselog
+}
+const log2 = getBaseLog(2)
+
+// Vector operations
+const addV = (a,b) => a.map((c,i) => c+b[i])
+const negV = (a,b) => a.map((c,i) => c-b[i])
+const multV = (a,b) => a.map((c,i) => c*b[i])
+const divV = (a,b) => a.map((c,i) => c/b[i])
+const addVS = (a,b) => a.map((c,i) => c+b)
+const negVS = (a,b) => a.map((c,i) => c-b)
+const multVS = (a,b) => a.map((c,i) => c*b)
+const divVS = (a,b) => a.map((c,i) => c/b)
+
+// Lua data Parser
+const Parser = callback => {
+	let openPointer = 0
+	let currentItem = ''
+	const parseLuaTable = string => {
+		try {
+			if (string.indexOf('_[') !== -1) {
+				savedVarDefs.forEach(([ find, repl ]) => {
+					string = string.replace(find, repl)
+				})
+			}
+			callback(JSON.parse(string.replace(/\["([^"\]]+)"\] = /g,'"$1":')))
+		} catch (e) {
+			console.warn(`INVALID: ${string}`, e)
+			// TODO: temporary to keep ids consistent
+			registry.newId()
+		}
+	}
+	const parseChar = char => {
+		if (openPointer > 1)
+			currentItem += char
+		switch (char) {
+			case '{':
+				openPointer += 1
+				break
+			case '}':
+				openPointer -= 1
+				if (openPointer <= 1) {
+					if (currentItem)
+						parseLuaTable('{'+currentItem)
+					currentItem = ''
+				}
+				break
+		}
+	}
+	let savedVarDefs = []
+	const varDefRE = /(_\[[0-9]+\]) = (\{[^\}]+\})/gmi
+	const parseData = data => {
+		const i = data.indexOf('return')
+		if (i !== -1) {
+			const varDefs = [ ...data.slice(0, i).matchAll(varDefRE) ]
+			if (varDefs.length)
+				savedVarDefs = varDefs.map(def => [ def[1], def[2] ])
+		}
+		for (const char of data)
+			parseChar(char)
+	}
+	return parseData
+}
+
+// Fetch data Reader
+const Reader = parser => response => {
+	const reader = response.body.getReader()
+	const stringDecoder = new TextDecoder("utf-8")
+	const processText = ({ done, value }) => {
+		if (done) return
+		parser(stringDecoder.decode(value))
+		return reader.read().then(processText)
+	}
+	return reader.read().then(processText);
+}
+
+// Input file Loader
+const Loader = (file, parser, callback) => {
+	file.onchange = function () {
+		document.getElementById('load-notify').innerHTML = "Loading..."
+		const reader = new FileReader()
+		reader.onload = () => {
+			parser(reader.result)
+			document.getElementById('load-notify').hidden = true
+			callback()
+		}
+		reader.readAsText(file.files[0])
+		file.value = ""
+	}
+}
+
+// Camera Controls
+const Controls = ({ camera, canvas }) => {
+	const vec = new THREE.Vector3()
+	const euler = new THREE.Euler( 0, 0, 0, 'YXZ' )
+	const PI_2 = Math.PI / 2
+	const pressedKeys = { }
+	const isLocked = () => document.pointerLockElement === canvas
+	const keys = {
+		w:     [ 0, 0, 1 ],
+		s:     [ 0, 0,-1 ],
+		a:     [-1, 0, 0 ],
+		d:     [ 1, 0, 0 ],
+		' ':   [ 0, 1, 0 ],
+		shift: [ 0,-1, 0 ]
+	}
+	const move = [
+		distance => {
+			vec.setFromMatrixColumn( camera.matrix, 0 )
+			camera.position.addScaledVector( vec, distance )
+		},
+		distance => {
+			camera.position.y += distance
+		},
+		distance => {
+			vec.setFromMatrixColumn( camera.matrix, 0 )
+			vec.crossVectors( camera.up, vec )
+			camera.position.addScaledVector( vec, distance )
+		}
+	]
+	const lookAround = ev => {
+		const movementX = event.movementX || event.mozMovementX || event.webkitMovementX || 0;
+		const movementY = event.movementY || event.mozMovementY || event.webkitMovementY || 0;
+
+		euler.setFromQuaternion( camera.quaternion );
+
+		euler.y -= movementX * 0.002;
+		euler.x -= movementY * 0.002;
+
+		euler.x = Math.max( - PI_2, Math.min( PI_2, euler.x ) );
+
+		camera.quaternion.setFromEuler( euler );
+	}
+	const onPointerlockChange = () => {
+		if ( isLocked() ) {
+			document.onmousemove = lookAround
+		} else document.onmousemove = null
+	}
+	document.onkeydown = ev => {
+		if (! isLocked()) return;
+		const key = ev.key.toLowerCase()
+		pressedKeys[key] = true
+	}
+	document.onkeyup = (ev) => {
+		const key = ev.key.toLowerCase()
+		if (pressedKeys[key]) delete pressedKeys[key]
+	}
+	canvas.onclick = () => {
+		canvas.requestPointerLock();
+	}
+	document.addEventListener( 'pointerlockchange', onPointerlockChange, false )
+
+	let watchInterval = false
+	const startWatching = () => {
+		let ltime = Date.now()
+		const moveStep = () => {
+			const ntime = Date.now()
+			const time = (ntime-ltime)/1000
+			ltime = ntime
+			const speed = 30 * (pressedKeys.e ? 100 : (pressedKeys.r ? 1 : 20))
+			const step = speed * time
+			const moves = [0,0,0]
+			for (const key in pressedKeys) {
+				for (const k in keys[key])
+					moves[k] += keys[key][k]
+			}
+			moves.forEach((v,i) => {
+				if (!v) return;
+				move[i](v*step)
+			})
+		}
+		watchInterval = setInterval(moveStep, 16)
+	}
+	const stopWatching = () => {
+		clearInterval(watchInterval)
+	}
+	return {
+		startWatching,
+		stopWatching
+	}
+}
+
+// Renderer
+const Renderer = canvas => {
+
+	const fov = 75
+	const aspect = 2
+	const near = 0.1
+	const far = 64000
+	const camera = new THREE.PerspectiveCamera(fov, aspect, near, far)
+
+
+	const renderer = new THREE.WebGLRenderer({ canvas })
+	function resizeRendererToDisplaySize() {
+		const canvas = renderer.domElement
+		const width = canvas.clientWidth
+		const height = canvas.clientHeight
+		const needResize = canvas.resized
+		if (needResize) {
+			renderer.setSize(width, height, false)
+			canvas.resized = false
+		}
+		return needResize
+	}
+	let animationFrame = false
+	const renderStep = () => {
+		if (resizeRendererToDisplaySize(renderer)) {
+			camera.aspect = canvas.clientWidth / canvas.clientHeight
+			camera.updateProjectionMatrix()
+		}
+		textLabels.forEach(updateTextPosition)
+		renderer.autoClear = true;
+		const sceneOrder = ret.sceneOrder.length
+			? ret.sceneOrder
+			: Object.keys(ret.scenes)
+		sceneOrder.forEach(sceneName => {
+			const scene = ret.scenes[sceneName]
+			if (!scene) return;
+			renderer.render(scene, camera)
+			renderer.autoClear = false;
+		})
+	}
+	const renderLoop = () => {
+		renderStep()
+		animationFrame = requestAnimationFrame(renderLoop)
+	}
+	const animate = () => {
+		if (animationFrame) return;
+		renderLoop()
+	}
+	const stop = () => {
+		cancelAnimationFrame(animationFrame)
+		animationFrame = false
+	}
+
+	window.onresize = () => {
+		canvas.width = window.innerWidth
+		canvas.height = window.innerHeight
+		canvas.resized = true
+	}
+	window.onresize()
+
+
+	const textLabels = []
+	const addTextLabel = text => {
+		textLabels.push(text)
+		// document.body.appendChild(text)
+	}
+
+	const areaLabels = area => [
+		{
+			label: `${area.name}: ${area.owner}: ${area.size.join(', ')}: ${area.center.join(', ')}`,
+			position: area.center,
+			color:'#999999',
+			size: 4
+		},
+		{
+			label: area.pos1.join(', '),
+			position: fixPos(area.pos1),
+			color: '#555555',
+			size: 1
+		},
+		{
+			label: area.pos2.join(', '),
+			position: fixPos(area.pos2),
+			color: '#555555',
+			size: 1
+		},
+	]
+
+	const textElements = spec => {
+		const div = document.createElement('div')
+
+		div.className = 'text-label'
+		div.innerHTML = spec.label
+		div.position3D = spec.position
+		div.size3D = spec.size
+
+		div.style.color = spec.color
+		div.style.position = 'absolute'
+		div.style.whiteSpace = 'nowrap'
+		div.style.display = 'none'
+
+		return div
+	}
+
+	const updateTextPosition = textEl => {
+		const vec = new THREE.Vector3()
+		vec.set(...textEl.position3D)
+		const vector = vec.project(renderer.camera);
+		const position2D = [
+			(vector.x + 1) / 2 * canvas.width,
+			-(vector.y - 1) / 2 * canvas.height
+		]
+		if (vector.z < 1
+		&&  vector.z > 0.9
+		&&  position2D[0] > 0
+		&&  position2D[1] > 0
+		&&  position2D[0] < canvas.width
+		&&  position2D[1] < canvas.height) {
+			const scale = 3000 * (1 - vector.z)
+			textEl.style.display = 'block'
+			textEl.style.left = position2D[0] + 'px';
+			textEl.style.top = position2D[1] + 'px';
+			textEl.style.fontSize = (textEl.size3D * scale) + 'px'
+		} else {
+			textEl.style.display = 'none'
+		}
+	}
+
+	const ret = {
+		scenes: {},
+		sceneOrder: [],
+		camera,
+		canvas,
+		animate,
+		stop
+	}
+	// const texts = areaLabels(area)
+	// const textEls = texts.map(textElements)
+	// textEls.forEach(addTextLabel)
+
+	return ret
+}
+
+// Area Registry
+const Registry = () => {
+	const areasById = {}
+	const areasByOwner = {}
+	const areasChildren = {}
+	let _areaId = 1
+	const areaId = () => _areaId++
+	const registerArea = areaSpec => {
+		const id = areaId()
+		const pos1 = coordObjToArray(areaSpec.pos1)
+		const pos2 = coordObjToArray(areaSpec.pos2)
+		const area = {
+			...areaSpec,
+			center: fixPos(pos1.map((n, i) => (n + pos2[i])/2)),
+			size: pos1.map((n, i) => Math.abs(n - pos2[i])),
+			id,
+			pos1,
+			pos2
+		}
+		area.cube = makeCube( area.center, area.size.map(n => n + 1), 0x999999, 'wireframe' ),
+
+		areasById[id] = area
+
+		if (areasByOwner[area.owner] === undefined)
+			areasByOwner[area.owner] = []
+		areasByOwner[area.owner].push(id)
+
+		if (areasChildren[area.parent] === undefined)
+			areasChildren[area.parent] = []
+		areasChildren[area.parent].push(id)
+	}
+	return {
+		add: registerArea,
+		ids: () => Object.keys(areasById),
+		owners: () => Object.keys(areasByOwner),
+		byId: id => areasById[id],
+		byOwner: owner => areasByOwner[owner],
+		byParent: id => areasChildren[id],
+		newId: areaId
+	}
+}
+
+// Generic make cube function
+const makeCube = ( pos, size, color = 0xffffff, opacity = 1 ) => {
+	const geometry = new THREE.BoxGeometry(...size);
+	const isWireFrame = opacity === 'wireframe'
+	const material = isWireFrame
+		? new THREE.LineBasicMaterial( { color } )
+		: new THREE.MeshBasicMaterial( { color, opacity, transparent: opacity < 1, flatShading: true } )
+	const cube = isWireFrame
+		? new THREE.LineSegments( new THREE.EdgesGeometry( geometry ), material )
+		: new THREE.Mesh( geometry, material )
+	cube.position.set(...pos)
+	return cube;
+}
+
+// Split areas into chunks by position
+const splitChunks = (areas, chunkSize) => {
+	const chunks = {}
+	areas.forEach(area => {
+		const c1 = divV(area.pos1, chunkSize)
+		const c2 = divV(area.pos2, chunkSize)
+		const p1 = c1.map(c => Math.floor(c) - 1)
+		const p2 = c2.map(c => Math.ceil (c) + 1)
+		for (let x = p1[0]; x <= p2[0]; x++) {
+			if (x+1 < c1[0] || x > c2[0]) continue
+			for (let y = p1[1]; y <= p2[1]; y++) {
+				if (y+1 < c1[1] || y > c2[1]) continue
+				for (let z = p1[2]; z <= p2[2]; z++) {
+					if (z+1 < c1[2] || z > c2[2]) continue
+					const key = [x,y,z].join(',')
+					if (chunks[key] === undefined)
+						chunks[key] = []
+					chunks[key].push(area.id)
+				}
+			}
+		}
+	})
+	return chunks
+}
+
+// Return chunk map renders for areas
+const chunkMap = (areas, chunkCounts) => {
+	const worldSize = [ 65536, 65536, 65536 ]
+	const chunkSize = divV(worldSize, chunkCounts)
+	const chunkRenderSize = chunkCounts.map((c, i) => {
+		const l = Math.ceil(Math.log(c))
+		if (l >= 4) return chunkSize[i]
+		return l * 256
+	})
+	const chunks = Object.entries( splitChunks(areas, chunkSize) )
+	const maxHeat = Math.max(...chunks.map(([,list]) => list.length))
+	return chunks.map(([ key, list ]) => makeCube(
+		fixPos( multV(
+			key.split(',').map((n,i) => parseInt(n)+0.5),
+			chunkRenderSize
+		) ),
+		chunkRenderSize,
+		0xffffff,
+		Math.max(Math.min(1, list.length / maxHeat), 0.05)
+	) )
+}
+
+// on user change, refresh both //displayFunct(users)
+// on chunk count change, refresh chunks
+// on distance change, should refresh itself
+
+const chunkChangeHandler = () => {
+	if (refreshCunkFunct) refreshCunkFunct()
+}
+const areasChangedHandler = () => {
+	displayFunct()
+}
+const distanceChangeHandler = () => {
+	maxAreaDistance = Math.max(parseInt(document.getElementById('distance-input').value), 1)
+}
+const ownerChangeHandler = () => {
+	displayFunct()
+}
+
+let refreshCunkFunct
+let maxAreaDistance = 500
+let displayTimeout = false
+const displayData = (registry, renderer) => () => {
+	const allIds = registry.ids()
+	if (! allIds.length) return;
+	const users = document.getElementById('owner-input').checked
+		? document.getElementById('owner-name-input').value.split(',')
+			.map(value => value.trim())
+			.filter(value => value)
+		: []
+	const doit = document.getElementById('areas-input').checked
+	// doit = true, users = []
+
+	// const chunkCounts = [ 128, 1, 128 ]
+	const ids = users.length
+		? [].concat(...users.map(user => {
+			const areas = registry.byOwner(user)
+			return areas ? areas : []
+		}))
+		: allIds
+	const areas = ids.map(id => registry.byId(id))
+
+	const scenes = {}
+
+	const areaScene = new THREE.Scene()
+	delete scenes.area
+	scenes.area = false
+	clearInterval(displayTimeout)
+	if (doit) {
+		scenes.area = areaScene
+		let oldIds = []
+		displayTimeout = setInterval(() => {
+			const newAreas = areas.filter(area => {
+				const delt = negV(
+					flatCoords(area.center),
+					flatCoords(coordObjToArray( renderer.camera.position ))
+				)
+				const delt2 = multV(delt, delt)
+				return Math.sqrt(delt2.reduce((a, n) => a + n, 0)) < maxAreaDistance
+			})
+			const newIds = newAreas.map(({ id }) => id)
+			const deleteObjs = oldIds
+				.filter(id => newIds.indexOf(id) === -1)
+				.map(id => registry.byId(id).cube)
+			const addObjs = newIds
+				.filter(id => oldIds.indexOf(id) === -1)
+				.map(id => registry.byId(id).cube)
+			oldIds = newIds
+			deleteObjs.forEach(cube => {
+				areaScene.remove(cube)
+			})
+			addObjs.forEach(cube => {
+				areaScene.add(cube)
+			})
+		}, 500)
+	}
+
+	refreshCunkFunct = refreshChunks(areas, scenes)
+	refreshCunkFunct()
+
+	Object.keys(renderer.scenes).forEach(sceneName => {
+		delete renderer.scenes[sceneName]
+	})
+	renderer.scenes = scenes
+}
+const refreshChunks = (areas, scenes) => () => {
+	const doit = document.getElementById('heatmap-input').checked
+	delete scenes.map
+	scenes.map = false
+	if (doit) {
+		const chunkCounts = [
+			Math.max(parseInt(document.getElementById('chunksx-input').value),1),
+			Math.max(parseInt(document.getElementById('chunksy-input').value),1),
+			Math.max(parseInt(document.getElementById('chunksz-input').value),1),
+		]
+		const mapScene = new THREE.Scene()
+		scenes.map = mapScene
+		chunkMap(areas, chunkCounts)
+		.forEach(cube => {
+			mapScene.add(cube)
+		})
+	}
+}
+
+
+
+const renderer = Renderer(document.getElementById('canvas'))
+
+const controls = Controls(renderer)
+
+const registry = Registry()
+
+renderer.sceneOrder = ['area','map']
+renderer.camera.position.y = 5000
+renderer.camera.position.x = 2000
+renderer.camera.lookAt(0, 0, 0)
+
+renderer.animate()
+controls.startWatching()
+
+const displayFunct = displayData(registry, renderer)
+Loader(
+	document.getElementById('file'),
+	Parser(registry.add),
+	displayFunct
+)
+
+const coordDisplay = document.getElementById('coords')
+setInterval(() => {
+	coordDisplay.innerHTML = fixPos(
+		coordObjToArray(
+			renderer.camera.position
+		).map(Math.round)
+	).join(', ')
+}, 500)
+
+
+</script>
